@@ -151,12 +151,13 @@ function queueCleanup(accId, userId, manual) {
 // called after a code/link was delivered: check the device list a few minutes later
 function scheduleCleanup(accId, userId, delayMin) {
   if ((process.env.DEVICE_CLEANUP || "off") === "off") return;
-  clearTimeout(cleanupTimers.get(accId));
+  const tkey = `${accId}:${userId}`;
+  clearTimeout(cleanupTimers.get(tkey));
   const ms = Number(delayMin !== undefined ? delayMin : process.env.DEVICE_CLEANUP_DELAY_MIN || 5) * 60000;
   cleanupTimers.set(
-    accId,
+    tkey,
     setTimeout(() => {
-      cleanupTimers.delete(accId);
+      cleanupTimers.delete(tkey);
       queueCleanup(accId, userId, false);
     }, ms)
   );
@@ -166,15 +167,20 @@ async function runCleanup(accId, userId, manual) {
   const acc = store.accounts[accId];
   if (mode === "off" || !acc || store.assignments[userId] !== accId) return;
   const say = (t) => manual && bot.sendMessage(userId, t).catch(() => {});
-  if (usersOn(accId) > 1) {
-    notifyAdmin(`Device cleanup skipped for ${accId}: several users share this account.`);
-    return say("Device cleanup isn't available on this account.");
-  }
+  const shared = usersOn(accId) > 1;
   try {
     const { cleanupDevices } = require("./netflix");
     const all = (store.devices[userId] || []).filter((r) => r.accId === accId);
     const latest = all[all.length - 1];
-    const ctx = latest && latest.device ? { keepName: latest.device, oldNames: all.slice(0, -1).map((r) => r.device).filter(Boolean) } : null;
+    if (shared && !(latest && latest.device)) return say("I couldn't tell which device you just signed in, so nothing was changed.");
+    // on a shared account, collect the other customers' device names so we never touch those
+    const otherNames = shared
+      ? Object.entries(store.assignments)
+          .filter(([u, a]) => a === accId && String(u) !== String(userId))
+          .flatMap(([u]) => (store.devices[u] || []).map((r) => r.device))
+          .filter(Boolean)
+      : [];
+    const ctx = latest && latest.device ? { keepName: latest.device, oldNames: all.slice(0, -1).map((r) => r.device).filter(Boolean), shared, otherNames } : null;
     const r = await cleanupDevices(accId, acc, (since) => getLatestNetflixCode(acc, since), {
       dryRun: mode !== "on",
       botHint: process.env.BOT_DEVICE_HINT || "linux",
@@ -339,12 +345,16 @@ bot.onText(/^\/login/, (msg) => {
 
   const picked = pickAccount(oldId);
   if (!picked) {
-    return bot.sendMessage(
-      chat,
-      oldId
-        ? "No new login is available right now. Your current login stays active. Try again later."
-        : "No login is available right now. Please contact the seller."
-    );
+    const cur = oldId && store.accounts[oldId];
+    if (cur) {
+      // nothing else to switch to: just show the login they already have
+      return bot.sendMessage(
+        chat,
+        `No other login is available right now, so you keep your current one:\nEmail: ${cur.email}\nPassword: ${cur.password}\n\n` +
+          `When Netflix asks for a code, request it there and then send /otp here.`
+      );
+    }
+    return bot.sendMessage(chat, "No login is available right now. Please contact the seller.");
   }
 
   // new login is secured first, then the old one is released
@@ -412,7 +422,7 @@ bot.onText(/^\/done/, (msg) => {
   }
   lastDone.set(id, Date.now());
   bot.sendMessage(msg.chat.id, "Checking your devices, this takes a minute...");
-  clearTimeout(cleanupTimers.get(accId));
+  clearTimeout(cleanupTimers.get(`${accId}:${id}`));
   queueCleanup(accId, id, true);
 });
 
@@ -452,6 +462,18 @@ bot.onText(/^\/remove (\d+)/, (msg, m) => {
   saveCustomers();
   bot.sendMessage(msg.chat.id, `Removed ${m[1]}.`);
   if (accId) afterRelease(accId, m[1], "customer removed");
+});
+
+// /unassign <telegramId>  -> take a customer off their login but KEEP their subscription
+// (the account stays "ready"; use this to clean up an account that has too many users)
+bot.onText(/^\/unassign(?:@\w+)?\s+(\d+)/, (msg, m) => {
+  if (!isAdmin(msg)) return;
+  const accId = store.assignments[m[1]];
+  if (!accId) return bot.sendMessage(msg.chat.id, "That user has no login assigned.");
+  delete store.assignments[m[1]];
+  delete store.devices[m[1]];
+  saveStore();
+  bot.sendMessage(msg.chat.id, `${m[1]} was taken off ${accId}. ${accId} now has ${usersOn(accId)} user(s). Their subscription is unchanged.`);
 });
 
 bot.onText(/^\/list/, (msg) => {
