@@ -3,18 +3,12 @@ require("dotenv").config();
 const fs = require("fs");
 const TelegramBot = require("node-telegram-bot-api");
 const { google } = require("googleapis");
-const { parseDeviceInfo } = require("./emailinfo");
 
 // ---- .env ----
 // TELEGRAM_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ADMIN_ID
 // GOOGLE_REFRESH_TOKEN         (optional: ONE shared inbox that receives all Netflix emails)
 // DATA_FILE=/data/customers.json, ACCOUNTS_FILE=/data/accounts.json   (Railway Volume paths)
 // AUTO_RESET=1                     (optional: password change + sign-out-everywhere when a login is released)
-// DEVICE_CLEANUP=off|dry|on        (keep only the user's NEWEST device on Netflix; start with "dry")
-// DEVICE_CLEANUP_DELAY_MIN=5       (minutes after /otp before the check runs)
-// WATCH_INTERVAL_SEC=60          (how often Gmail is checked for "new device" emails)
-// WATCH_CLEANUP_DELAY_MIN=1       (minutes after a new device signs in before the old one is removed)
-// BOT_DEVICE_HINT=linux            (regex that matches the bot's own browser in Netflix's device list)
 // SESSIONS_DIR=/data/sessions      (saved Netflix sessions, keep on the Volume)
 
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
@@ -53,11 +47,7 @@ try {
 store.accounts = store.accounts || {};
 store.assignments = store.assignments || {};
 store.lastChange = store.lastChange || {};
-store.watch = store.watch || {}; // accountId -> ms timestamp of the last 'new device' email handled
-store.devices = store.devices || {};
-store.owned = store.owned || {}; // shared accounts: accId -> [{key, owner, fresh}] rows on Netflix's device list and who they belong to
-store.otpLog = store.otpLog || {}; // accId -> [{userId, at}] who asked for a code and when
-store.lastScan = store.lastScan || {}; // accId -> ms of the last device-list scan // telegramId -> [{accId,emailId,at,device,profile,location,raw}]
+store.otp = store.otp || {}; // telegramId -> { used: n, until: ms }  (code approvals, see /otp)
 const saveStore = () => fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(store, null, 2));
 
 const usersOn = (accId) => Object.values(store.assignments).filter((a) => a === accId).length;
@@ -74,7 +64,6 @@ function releaseUser(userId) {
   const accId = store.assignments[userId];
   if (!accId) return null;
   delete store.assignments[userId];
-  delete store.devices[userId];
   saveStore();
   return accId;
 }
@@ -127,174 +116,6 @@ async function autoReset(accId) {
         `Fix it manually, then /setpass ${accId} <password> and /ready ${accId}.`
     );
     if (e.shot) bot.sendPhoto(process.env.ADMIN_ID, e.shot).catch(() => {});
-  }
-}
-
-// remember which device asked for the code (name/profile/location come from the email)
-function recordDevice(userId, accId, info, emailId) {
-  if (!info || !emailId) return false;
-  // the bot's own headless browser also triggers "new device" emails - never record it
-  if (info.device && new RegExp(process.env.BOT_DEVICE_HINT || "linux", "i").test(info.device)) return false;
-  const list = (store.devices[userId] = store.devices[userId] || []);
-  if (list.some((r) => r.emailId === emailId)) return false; // already saved
-  list.push({ accId, emailId, at: Date.now(), device: info.device, profile: info.profile, location: info.location, when: info.when, raw: info.raw });
-  if (list.length > 10) list.shift();
-  saveStore();
-  return true;
-}
-
-// ---- one-device-per-user cleanup (DEVICE_CLEANUP=dry|on) ----
-const cleanupTimers = new Map();
-const lastDone = new Map();
-function queueCleanup(accId, userId, manual) {
-  resetQueue = resetQueue.then(() => runCleanup(accId, userId, manual)).catch(console.error);
-}
-// called after a code/link was delivered: check the device list a few minutes later
-function scheduleCleanup(accId, userId, delayMin) {
-  if ((process.env.DEVICE_CLEANUP || "off") === "off") return;
-  const tkey = `${accId}:${userId}`;
-  clearTimeout(cleanupTimers.get(tkey));
-  const ms = Number(delayMin !== undefined ? delayMin : process.env.DEVICE_CLEANUP_DELAY_MIN || 5) * 60000;
-  cleanupTimers.set(
-    tkey,
-    setTimeout(() => {
-      cleanupTimers.delete(tkey);
-      queueCleanup(accId, userId, false);
-    }, ms)
-  );
-}
-// ---- shared accounts: remember which rows of Netflix's device list belong to which customer ----
-// Customers have no password, so every NEW device needs a code from /otp. That moment tells us who
-// the next new row on the device list belongs to. Emails from Netflix are not needed.
-function logOtp(accId, userId) {
-  const list = (store.otpLog[accId] = store.otpLog[accId] || []);
-  list.push({ userId: String(userId), at: Date.now() });
-  if (list.length > 40) list.shift();
-  saveStore();
-}
-const rowKey = (t) =>
-  (t || "")
-    .replace(/\d{1,2}\/\d{1,2}\/\d{2,4},?\s*\d{1,2}:\d{2}\s*[ap]m(\s*[A-Z]{2,5})?/gi, " ")
-    .replace(/current device|last used|sign out|device|[^a-z0-9 ]/gi, " ")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 60);
-
-function makeOwnerPlanner(accId, userId, botHint) {
-  const uid = String(userId);
-  const botRe = new RegExp(botHint || "linux", "i");
-  let reconciled = false;
-  return (rows) => {
-    const isBot = (r) => r.isCurrent || botRe.test(r.text);
-    const lines = rows.map(
-      (r) => `- ${r.text.slice(0, 90)} => ` + (isBot(r) ? "(current/bot device, ignored)" : Number.isFinite(r.age) ? `${Math.round(r.age)} min ago` : "time unreadable")
-    );
-    const devices = rows.filter((r) => !isBot(r)).map((r) => ({ ...r, key: rowKey(r.text) }));
-    if (!devices.length) return { action: "abort", note: "Shared account: couldn't read any device rows. Nothing changed.", lines, remove: [] };
-
-    const count = {};
-    devices.forEach((d) => (count[d.key] = (count[d.key] || 0) + 1));
-    // forget rows that no longer exist on Netflix
-    const seen = {};
-    let owned = (store.owned[accId] || []).filter((e) => {
-      seen[e.key] = (seen[e.key] || 0) + 1;
-      return seen[e.key] <= (count[e.key] || 0);
-    });
-
-    if (!reconciled) {
-      reconciled = true;
-      owned.forEach((e) => (e.fresh = false));
-      const asks = (store.otpLog[accId] || []).filter((e) => !e.done); // code requests not yet matched to a scan
-      const requesters = [...new Set(asks.map((e) => e.userId))];
-      const owner = requesters.length === 1 ? requesters[0] : null;
-      const isFirst = !(store.owned[accId] || []).length;
-      const sinceMin = asks.length ? (Date.now() - Math.min(...asks.map((e) => e.at))) / 60000 : 0;
-      const have = {};
-      owned.forEach((e) => (have[e.key] = (have[e.key] || 0) + 1));
-      for (const d of devices) {
-        if ((have[d.key] || 0) >= count[d.key]) continue;
-        have[d.key] = (have[d.key] || 0) + 1;
-        // first scan ever: only rows used since the code was requested are attributed
-        const mine = owner && (!isFirst || (Number.isFinite(d.age) && d.age <= sinceMin + 3));
-        owned.push({ key: d.key, owner: mine ? owner : null, fresh: !!mine && owner === uid });
-      }
-      asks.forEach((e) => (e.done = true));
-      store.lastScan[accId] = Date.now();
-      if (requesters.length > 1) notifyAdmin(`${accId}: ${requesters.length} customers asked for a code at about the same time, so their new devices can't be told apart. Nothing was signed out for them.`);
-    }
-    store.owned[accId] = owned;
-    saveStore();
-
-    const fresh = owned.filter((e) => e.owner === uid && e.fresh);
-    const old = owned.filter((e) => e.owner === uid && !e.fresh);
-    if (!fresh.length) return { action: "none", note: "Shared account: no new device found for this customer.", lines, remove: [] };
-    if (!old.length) return { action: "none", note: "Shared account: this customer has no earlier device on record.", lines, remove: [] };
-
-    const remove = [];
-    const skipped = [];
-    for (const key of [...new Set(old.map((e) => e.key))]) {
-      const sameKey = owned.filter((e) => e.key === key);
-      if (sameKey.some((e) => e.owner !== uid)) {
-        skipped.push(key);
-        continue; // the same device name belongs to someone else too: never guess
-      }
-      const need = old.filter((e) => e.key === key).length;
-      const rowsHere = devices.filter((d) => d.key === key).sort((a, b) => b.age - a.age); // oldest first
-      if (rowsHere.length > need && rowsHere.some((d) => !Number.isFinite(d.age))) {
-        skipped.push(key);
-        continue;
-      }
-      remove.push(...rowsHere.slice(0, need));
-    }
-    const keep = devices.find((d) => fresh.some((f) => f.key === d.key && !remove.includes(d))) || null;
-    if (!remove.length) {
-      return skipped.length
-        ? { action: "abort", note: "Shared account: the old device looks the same as another customer's device, so nothing was signed out.", lines, remove: [] }
-        : { action: "none", note: "Shared account: nothing to sign out.", lines, remove: [] };
-    }
-    return { action: "remove", method: "owner", keep, remove, lines, note: "Shared account: signing out this customer's previous device." };
-  };
-}
-
-async function runCleanup(accId, userId, manual) {
-  const mode = process.env.DEVICE_CLEANUP || "off";
-  const acc = store.accounts[accId];
-  if (mode === "off" || !acc || store.assignments[userId] !== accId) return;
-  const say = (t) => manual && bot.sendMessage(userId, t).catch(() => {});
-  const shared = usersOn(accId) > 1;
-  try {
-    const { cleanupDevices } = require("./netflix");
-    const all = (store.devices[userId] || []).filter((r) => r.accId === accId);
-    const latest = all[all.length - 1];
-    const hint = process.env.BOT_DEVICE_HINT || "linux";
-    // one customer on the account: use the device names from Netflix's emails (as before)
-    // several customers: use the ownership list built from /otp requests
-    const ctx = !shared && latest && latest.device ? { keepName: latest.device, oldNames: all.slice(0, -1).map((r) => r.device).filter(Boolean) } : null;
-    const r = await cleanupDevices(accId, acc, (since) => getLatestNetflixCode(acc, since), {
-      dryRun: mode !== "on",
-      botHint: hint,
-      ctx,
-      planner: shared ? makeOwnerPlanner(accId, userId, hint) : undefined,
-    });
-    if (mode === "on" && r.removed > 0 && latest) {
-      store.devices[userId] = [latest]; // only the current device stays on record
-      saveStore();
-    }
-    if (mode !== "on" || r.removed > 0 || r.warn) notifyAdmin(`Device check ${accId} (${mode}):\n${r.report}`);
-    if (mode !== "on") return say("Check complete.");
-    if (r.removed > 0) {
-      bot.sendMessage(userId, "Your previous device was signed out. Your new device is active.").catch(() => {});
-    } else if (r.warn) {
-      say("I couldn't tell which device is older, so I changed nothing. The seller has been notified.");
-    } else {
-      say("No other device found to sign out.");
-    }
-  } catch (e) {
-    console.error(e);
-    notifyAdmin(`Device cleanup failed for ${accId}: ${e.message}`);
-    if (e.shot) bot.sendPhoto(process.env.ADMIN_ID, e.shot).catch(() => {});
-    say("Something went wrong while checking devices. The seller has been notified.");
   }
 }
 
@@ -354,63 +175,12 @@ async function getLatestNetflixCode(acc, afterSec) {
     const subject = (full.data.payload.headers.find((h) => h.name === "Subject") || {}).value || "";
     const html = walkParts(full.data.payload, "text/html");
     const plain = walkParts(full.data.payload, "text/plain");
-    const info = parseDeviceInfo(subject + " " + plain + " " + html);
     const direct = findCode(subject + " " + plain + " " + html);
-    if (direct) return { code: direct, info, emailId: m.id };
+    if (direct) return { code: direct };
     const link = extractGetCodeLink(html);
-    if (link) return { link, info, emailId: m.id };
+    if (link) return { link };
   }
   return null;
-}
-
-/* ===================== watcher: "A new device is using your account" ===================== */
-// Netflix sends this email when a device signs in. That is the moment to save the device
-// and (a minute later) remove the user's older device. Works without the user pressing /otp.
-let watching = false;
-async function checkNewDeviceEmails(accId) {
-  const acc = store.accounts[accId];
-  const users = Object.entries(store.assignments).filter(([, a]) => a === accId).map(([u]) => u);
-  if (!acc || users.length !== 1) return; // single-user accounts only
-  const userId = users[0];
-  if (!store.watch[accId]) {
-    store.watch[accId] = Date.now();
-    return saveStore();
-  }
-  const last = store.watch[accId];
-  const toFilter = acc.refreshToken ? "" : ` to:${acc.email}`;
-  const gmail = gmailFor(acc);
-  const list = await gmail.users.messages.list({
-    userId: "me",
-    q: `from:netflix.com (subject:"new device" OR subject:"using your account") newer_than:1d${toFilter}`,
-    maxResults: 10,
-  });
-  let newest = last;
-  let recorded = false;
-  for (const m of list.data.messages || []) {
-    const full = await gmail.users.messages.get({ userId: "me", id: m.id, format: "full" });
-    const at = Number(full.data.internalDate || 0);
-    if (at <= last) continue;
-    newest = Math.max(newest, at);
-    const subject = (full.data.payload.headers.find((h) => h.name === "Subject") || {}).value || "";
-    const info = parseDeviceInfo(subject + " " + walkParts(full.data.payload, "text/plain") + " " + walkParts(full.data.payload, "text/html"));
-    if (recordDevice(userId, accId, info, m.id)) recorded = true;
-  }
-  if (newest !== last) {
-    store.watch[accId] = newest;
-    saveStore();
-  }
-  if (recorded) scheduleCleanup(accId, userId, Number(process.env.WATCH_CLEANUP_DELAY_MIN || 1));
-}
-if ((process.env.DEVICE_CLEANUP || "off") !== "off") {
-  setInterval(async () => {
-    if (watching) return;
-    watching = true;
-    try {
-      for (const accId of Object.keys(store.accounts)) await checkNewDeviceEmails(accId).catch((e) => console.error("watch:", e.message));
-    } finally {
-      watching = false;
-    }
-  }, Number(process.env.WATCH_INTERVAL_SEC || 60) * 1000);
 }
 
 /* ===================== customer commands ===================== */
@@ -421,7 +191,7 @@ const NO_PLAN = "Your subscription is not active. Contact the seller to renew.";
 bot.onText(/^\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "/login - get your Netflix login\n/otp - get the sign-in code (request it on Netflix first)\n/mylogin - show your current login\n/done - after logging in on a new device, sign out the old one\n/status - subscription validity"
+    "/login - get your Netflix login\n/otp - get the sign-in code (request it on Netflix first)\n/mylogin - show your current login\n/status - subscription validity"
   );
 });
 
@@ -453,7 +223,6 @@ bot.onText(/^\/login/, (msg) => {
   if (oldId) releaseUser(id);
   store.assignments[id] = newId;
   store.lastChange[id] = Date.now();
-  store.watch[newId] = Date.now(); // only emails from now on count for this user
   saveStore();
 
   bot.sendMessage(
@@ -473,11 +242,60 @@ bot.onText(/^\/mylogin/, (msg) => {
   bot.sendMessage(msg.chat.id, `Email: ${acc.email}`);
 });
 
+// ---- code approval: the first code is free, every further one needs the seller's OK ----
+const OTP_FREE_USES = Number(process.env.OTP_FREE_USES || 1); // codes a customer gets without asking
+const OTP_WINDOW_MS = Number(process.env.OTP_APPROVAL_WINDOW_MIN || 15) * 60000; // how long one OK stays valid
+const pendingApproval = new Map(); // customerId -> time of the open request
+
+function requestApproval(msg, id) {
+  const chat = msg.chat.id;
+  const t = pendingApproval.get(id);
+  if (t && Date.now() - t < 30 * 60000) {
+    return bot.sendMessage(chat, "Your request is already waiting for the seller's approval. You'll get a message here.");
+  }
+  pendingApproval.set(id, Date.now());
+  const o = store.otp[id] || { used: 0 };
+  const accId = store.assignments[id];
+  const who = [msg.from.first_name, msg.from.username ? "@" + msg.from.username : ""].filter(Boolean).join(" ");
+  bot
+    .sendMessage(
+      process.env.ADMIN_ID,
+      `Code request\nCustomer: ${who} (${id})\nAccount: ${accId}\nCodes given so far: ${o.used}\n\nApprove a new device?`,
+      { reply_markup: { inline_keyboard: [[{ text: "Approve", callback_data: `otp_ok:${id}` }, { text: "Deny", callback_data: `otp_no:${id}` }]] } }
+    )
+    .catch(console.error);
+  bot.sendMessage(chat, "Your request was sent to the seller for approval. You'll get a message here when it's decided.");
+}
+
+bot.on("callback_query", (q) => {
+  if (String(q.from.id) !== process.env.ADMIN_ID) return bot.answerCallbackQuery(q.id).catch(() => {});
+  const m = /^otp_(ok|no):(\d+)$/.exec(q.data || "");
+  if (!m) return bot.answerCallbackQuery(q.id).catch(() => {});
+  const uid = Number(m[2]);
+  const edit = (t) => q.message && bot.editMessageText(t, { chat_id: q.message.chat.id, message_id: q.message.message_id }).catch(() => {});
+  pendingApproval.delete(uid);
+  if (m[1] === "ok") {
+    const o = (store.otp[uid] = store.otp[uid] || { used: 0, until: 0 });
+    o.until = Date.now() + OTP_WINDOW_MS;
+    saveStore();
+    bot.sendMessage(uid, `Approved. Request the code on Netflix now, then send /otp here within ${Math.round(OTP_WINDOW_MS / 60000)} minutes.`).catch(() => {});
+    edit(`Approved for ${uid}.`);
+  } else {
+    bot.sendMessage(uid, "Your request was not approved. Contact the seller.").catch(() => {});
+    edit(`Denied for ${uid}.`);
+  }
+  bot.answerCallbackQuery(q.id).catch(() => {});
+});
+
 bot.onText(/^\/otp/, async (msg) => {
   const id = msg.from.id;
   if (!hasAccess(id)) return bot.sendMessage(msg.chat.id, NO_PLAN);
   const acc = store.accounts[store.assignments[id]];
   if (!acc) return bot.sendMessage(msg.chat.id, "You don't have a login yet. Send /login first.");
+
+  const o = (store.otp[id] = store.otp[id] || { used: 0, until: 0 });
+  const inWindow = o.until > Date.now();
+  if (!inWindow && o.used >= OTP_FREE_USES) return requestApproval(msg, id);
 
   if (Date.now() - (lastOtp.get(id) || 0) < OTP_COOLDOWN_MS) {
     return bot.sendMessage(msg.chat.id, "Please wait 30 seconds before trying again.");
@@ -491,31 +309,16 @@ bot.onText(/^\/otp/, async (msg) => {
     else if (result && result.link) text = `Tap this link now to see your code (it expires soon):\n${result.link}`;
     else text = "No new code found. Request the code on Netflix first, then try again in a few seconds.";
     bot.sendMessage(msg.chat.id, text);
-    if (result && (result.code || result.link)) {
-      recordDevice(id, store.assignments[id], result.info, result.emailId);
-      logOtp(store.assignments[id], id);
-      scheduleCleanup(store.assignments[id], id);
+    if (result && (result.code || result.link) && !inWindow) {
+      // a free code was used: count it and keep a short window open so a retry doesn't need approval
+      o.used++;
+      o.until = Date.now() + OTP_WINDOW_MS;
+      saveStore();
     }
   } catch (e) {
     console.error(e);
     bot.sendMessage(msg.chat.id, "Something went wrong. Try again shortly.");
   }
-});
-
-// /done: "my new device is logged in" -> remove the older device right now
-bot.onText(/^\/done/, (msg) => {
-  const id = msg.from.id;
-  if (!hasAccess(id)) return bot.sendMessage(msg.chat.id, NO_PLAN);
-  const accId = store.assignments[id];
-  if (!accId) return bot.sendMessage(msg.chat.id, "You don't have a login yet. Send /login first.");
-  if ((process.env.DEVICE_CLEANUP || "off") === "off") return bot.sendMessage(msg.chat.id, "Not available right now.");
-  if (Date.now() - (lastDone.get(id) || 0) < 2 * 60 * 1000) {
-    return bot.sendMessage(msg.chat.id, "Please wait 2 minutes before trying again.");
-  }
-  lastDone.set(id, Date.now());
-  bot.sendMessage(msg.chat.id, "Checking your devices, this takes a minute...");
-  clearTimeout(cleanupTimers.get(`${accId}:${id}`));
-  queueCleanup(accId, id, true);
 });
 
 bot.onText(/^\/status/, (msg) => {
@@ -550,6 +353,7 @@ bot.onText(/^\/add (\d+) (\d+|lifetime)/i, (msg, m) => {
 bot.onText(/^\/remove (\d+)/, (msg, m) => {
   if (!isAdmin(msg)) return;
   const accId = releaseUser(m[1]);
+  delete store.otp[m[1]];
   customers.delete(Number(m[1]));
   saveCustomers();
   bot.sendMessage(msg.chat.id, `Removed ${m[1]}.`);
@@ -563,7 +367,6 @@ bot.onText(/^\/unassign(?:@\w+)?\s+(\d+)/, (msg, m) => {
   const accId = store.assignments[m[1]];
   if (!accId) return bot.sendMessage(msg.chat.id, "That user has no login assigned.");
   delete store.assignments[m[1]];
-  delete store.devices[m[1]];
   saveStore();
   bot.sendMessage(msg.chat.id, `${m[1]} was taken off ${accId}. ${accId} now has ${usersOn(accId)} user(s). Their subscription is unchanged.`);
 });
@@ -578,17 +381,25 @@ bot.onText(/^\/list/, (msg) => {
   bot.sendMessage(msg.chat.id, lines.join("\n"));
 });
 
-// /devices <telegramId> -> what the bot saved from that user's sign-in emails
-bot.onText(/^\/devices (\d+)/, (msg, m) => {
+// /allow <telegramId> [minutes]  -> let a customer take a code now without asking
+bot.onText(/^\/allow(?:@\w+)?\s+(\d+)(?:\s+(\d+))?\s*$/, (msg, m) => {
   if (!isAdmin(msg)) return;
-  const list = store.devices[m[1]] || [];
-  if (!list.length) return bot.sendMessage(msg.chat.id, "Nothing saved for that user yet.");
-  bot.sendMessage(
-    msg.chat.id,
-    list
-      .map((r, i) => `${i + 1}. ${r.device || "(device not found)"} | name: ${r.profile || "-"} | ${r.location || "-"} | ${r.when || new Date(r.at).toLocaleString("en-IN")}\n   email text: ${r.raw}`)
-      .join("\n")
-  );
+  const mins = m[2] ? Number(m[2]) : Math.round(OTP_WINDOW_MS / 60000);
+  const o = (store.otp[m[1]] = store.otp[m[1]] || { used: 0, until: 0 });
+  o.until = Date.now() + mins * 60000;
+  pendingApproval.delete(Number(m[1]));
+  saveStore();
+  bot.sendMessage(msg.chat.id, `${m[1]} may request codes for the next ${mins} minute(s).`);
+  bot.sendMessage(Number(m[1]), `The seller approved a new code. Request it on Netflix, then send /otp here within ${mins} minutes.`).catch(() => {});
+});
+
+// /otpreset <telegramId>  -> back to "first code is free" for this customer
+bot.onText(/^\/otpreset(?:@\w+)?\s+(\d+)/, (msg, m) => {
+  if (!isAdmin(msg)) return;
+  delete store.otp[m[1]];
+  pendingApproval.delete(Number(m[1]));
+  saveStore();
+  bot.sendMessage(msg.chat.id, `Code counter reset for ${m[1]}.`);
 });
 
 // /accounts -> pool overview
@@ -641,7 +452,6 @@ bot.onText(/^\/delaccount(?:@\w+)?\s+(\S+)/, (msg, m) => {
   const n = usersOn(id);
   if (n > 0) return bot.sendMessage(msg.chat.id, `${id} still has ${n} user(s) assigned. Use /remove <telegramId> for them first.`);
   delete store.accounts[id];
-  delete store.watch[id];
   saveStore();
   bot.sendMessage(msg.chat.id, `Removed ${id} from the pool.`);
 });
