@@ -280,7 +280,8 @@ async function cleanupDevices(accId, acc, getCode, opts = {}) {
     }
     await page.waitForTimeout(3000);
 
-    const first = planCleanup(await readDevices(page), opts.botHint, opts.ctx);
+    const planFn = (rows) => (opts.planner ? opts.planner(rows) : planCleanup(rows, opts.botHint, opts.ctx));
+    const first = planFn(await readDevices(page));
     let report = first.lines.join("\n") + (first.note ? `\n${first.note}` : "");
     if (first.action !== "remove") {
       return { report, removed: 0, warn: first.action === "abort" };
@@ -290,7 +291,7 @@ async function cleanupDevices(accId, acc, getCode, opts = {}) {
 
     let removed = 0;
     for (let i = 0; i < 8; i++) {
-      const plan = planCleanup(await readDevices(page), opts.botHint, opts.ctx);
+      const plan = planFn(await readDevices(page));
       if (plan.action !== "remove" || plan.method !== first.method) break; // never switch method mid-way
       const target = plan.remove[plan.remove.length - 1];
       const card = page.locator(`[data-dev-idx="${target.idx}"]`);
