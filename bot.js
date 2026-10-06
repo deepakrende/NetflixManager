@@ -9,7 +9,6 @@ const { parseDeviceInfo } = require("./emailinfo");
 // TELEGRAM_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ADMIN_ID
 // GOOGLE_REFRESH_TOKEN         (optional: ONE shared inbox that receives all Netflix emails)
 // DATA_FILE=/data/customers.json, ACCOUNTS_FILE=/data/accounts.json   (Railway Volume paths)
-// LOGIN_CHANGE_COOLDOWN_HOURS=24   (how often a user may swap to a new login)
 // AUTO_RESET=1                     (optional: password change + sign-out-everywhere when a login is released)
 // DEVICE_CLEANUP=off|dry|on        (keep only the user's NEWEST device on Netflix; start with "dry")
 // DEVICE_CLEANUP_DELAY_MIN=5       (minutes after /otp before the check runs)
@@ -58,7 +57,6 @@ store.watch = store.watch || {}; // accountId -> ms timestamp of the last 'new d
 store.devices = store.devices || {}; // telegramId -> [{accId,emailId,at,device,profile,location,raw}]
 const saveStore = () => fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(store, null, 2));
 
-const CHANGE_COOLDOWN_MS = Number(process.env.LOGIN_CHANGE_COOLDOWN_HOURS || 24) * 3600000;
 const usersOn = (accId) => Object.values(store.assignments).filter((a) => a === accId).length;
 
 // first "ready" account with free capacity, skipping the one the user already has
@@ -337,12 +335,7 @@ bot.onText(/^\/login/, (msg) => {
   if (!hasAccess(id)) return bot.sendMessage(chat, NO_PLAN);
 
   const oldId = store.assignments[id];
-  if (oldId) {
-    const wait = (store.lastChange[id] || 0) + CHANGE_COOLDOWN_MS - Date.now();
-    if (wait > 0) {
-      return bot.sendMessage(chat, `You can change your login again in ${Math.ceil(wait / 3600000)} hour(s).`);
-    }
-  }
+  // no cooldown: customers may change their login at any time
 
   const picked = pickAccount(oldId);
   if (!picked) {
