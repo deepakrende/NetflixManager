@@ -18,12 +18,53 @@ const notifyAdmin = (t) => bot.sendMessage(process.env.ADMIN_ID, t).catch(() => 
 /* ===================== customers + subscriptions ===================== */
 // telegramId -> expiry timestamp (ms), or null = LIFETIME
 const DATA_FILE = process.env.DATA_FILE || "./customers.json";
+
+// ---- safe JSON storage: atomic writes, hourly backup, never overwrite a file we couldn't read ----
+const startupNotes = []; // sent to the admin once the bot is up
+function loadJson(file, fallback) {
+  const read = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
+  if (!fs.existsSync(file)) {
+    if (fs.existsSync(file + ".bak")) {
+      try {
+        const d = read(file + ".bak");
+        startupNotes.push(`${file} was missing; restored from its backup.`);
+        return d;
+      } catch (e) {}
+    }
+    return fallback;
+  }
+  try {
+    return read(file);
+  } catch (e) {
+    console.error(`Could not read ${file}: ${e.message}`);
+    try {
+      const d = read(file + ".bak");
+      startupNotes.push(`${file} was unreadable; restored from its backup.`);
+      return d;
+    } catch (e2) {}
+    try {
+      fs.renameSync(file, `${file}.corrupt-${Date.now()}`);
+    } catch (e3) {}
+    startupNotes.push(`${file} was unreadable and no backup worked. Started empty; the broken file was kept as ${file}.corrupt-*`);
+    return fallback;
+  }
+}
+const lastBackup = {};
+function saveJson(file, text) {
+  const tmp = file + ".tmp";
+  fs.writeFileSync(tmp, text);
+  if (fs.existsSync(file) && Date.now() - (lastBackup[file] || 0) > 3600000) {
+    try {
+      fs.copyFileSync(file, file + ".bak");
+      lastBackup[file] = Date.now();
+    } catch (e) {}
+  }
+  fs.renameSync(tmp, file); // the real file is replaced in one step, never half-written
+}
+
 const customers = new Map();
-try {
-  const saved = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  for (const [id, exp] of Object.entries(saved)) customers.set(Number(id), exp);
-} catch (e) {}
-const saveCustomers = () => fs.writeFileSync(DATA_FILE, JSON.stringify(Object.fromEntries(customers)));
+for (const [id, exp] of Object.entries(loadJson(DATA_FILE, {}))) customers.set(Number(id), exp);
+const saveCustomers = () => saveJson(DATA_FILE, JSON.stringify(Object.fromEntries(customers)));
 function hasAccess(id) {
   if (!customers.has(id)) return false;
   const exp = customers.get(id);
@@ -40,15 +81,12 @@ function describeExpiry(exp) {
 //                          "capacity": 1, "status": "ready" } },
 //   "assignments": { "<telegramId>": "nf1" }, "lastChange": {} }
 const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE || "./accounts.json";
-let store = { accounts: {}, assignments: {}, lastChange: {} };
-try {
-  store = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
-} catch (e) {}
+let store = loadJson(ACCOUNTS_FILE, { accounts: {}, assignments: {}, lastChange: {} });
 store.accounts = store.accounts || {};
 store.assignments = store.assignments || {};
 store.lastChange = store.lastChange || {};
 store.otp = store.otp || {}; // telegramId -> { used: n, until: ms }  (code approvals, see /otp)
-const saveStore = () => fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(store, null, 2));
+const saveStore = () => saveJson(ACCOUNTS_FILE, JSON.stringify(store, null, 2));
 
 const usersOn = (accId) => Object.values(store.assignments).filter((a) => a === accId).length;
 
@@ -67,17 +105,6 @@ function releaseUser(userId) {
   saveStore();
   return accId;
 }
-function adminResetNotice(accId, userId, why) {
-  const acc = store.accounts[accId];
-  const others = usersOn(accId);
-  notifyAdmin(
-    `Account ${accId} (${acc ? acc.email : "?"}) was released by user ${userId} (${why}).\n` +
-      `Sign out of all devices and change the password in Netflix, then run:\n` +
-      `/setpass ${accId} <newpassword>\n/ready ${accId}` +
-      (others ? `\nNote: ${others} other user(s) are still assigned to it.` : "")
-  );
-}
-
 // ---- automatic Netflix reset (opt-in: AUTO_RESET=1, needs netflix.js + playwright) ----
 let resetQueue = Promise.resolve(); // one browser at a time
 function afterRelease(accId, userId, why) {
@@ -90,6 +117,7 @@ function afterRelease(accId, userId, why) {
 async function autoReset(accId) {
   const acc = store.accounts[accId];
   if (!acc) return;
+  if (!acc.password) return notifyAdmin(`Auto reset skipped for ${accId}: no password is stored for it. Set one with /setpass ${accId} <password>.`);
   try {
     const { rotatePassword } = require("./netflix");
     const res = await rotatePassword(
@@ -118,6 +146,43 @@ async function autoReset(accId) {
     if (e.shot) bot.sendPhoto(process.env.ADMIN_ID, e.shot).catch(() => {});
   }
 }
+
+/* ===================== Gmail health + alerts ===================== */
+const alertAt = {};
+function alertAdmin(key, text, everyMin = 30) {
+  if (Date.now() - (alertAt[key] || 0) < everyMin * 60000) return; // don't spam the admin
+  alertAt[key] = Date.now();
+  notifyAdmin(text);
+}
+// turn a Google error into something you can act on (null = not a Gmail access problem)
+function gmailProblem(e) {
+  const raw = String((e && e.message) || "") + " " + JSON.stringify((e && e.response && e.response.data) || {});
+  if (/unauthorized_client|invalid_client/i.test(raw))
+    return "Google rejects the client ID / secret / refresh token combination. Generate a new refresh token with the SAME client ID and secret that are set in Railway.";
+  if (/invalid_grant/i.test(raw))
+    return "The refresh token expired or was revoked (tokens last only 7 days while the OAuth consent screen is in 'Testing'). Generate a new refresh token.";
+  if (/invalid credentials|login required|insufficient|\b40[13]\b|permission/i.test(raw))
+    return "Google refused the Gmail request. Check that the Gmail API is enabled and the token has gmail.readonly access.";
+  return null;
+}
+async function checkGmail() {
+  const tokens = new Set([process.env.GOOGLE_REFRESH_TOKEN, ...Object.values(store.accounts).map((a) => a.refreshToken)].filter(Boolean));
+  if (!tokens.size) return "No Gmail refresh token is set (GOOGLE_REFRESH_TOKEN).";
+  for (const t of tokens) {
+    try {
+      await gmailFor({ refreshToken: t }).users.getProfile({ userId: "me" });
+    } catch (e) {
+      return gmailProblem(e) || `Gmail check failed: ${e.message}`;
+    }
+  }
+  return null; // all good
+}
+async function gmailWatchdog() {
+  const problem = await checkGmail();
+  if (problem) alertAdmin("gmail-health", `Gmail access is BROKEN, customers can't get codes.\\n${problem}`, 360);
+}
+setTimeout(gmailWatchdog, 15000);
+setInterval(gmailWatchdog, 6 * 3600000);
 
 /* ===================== Gmail (one client per inbox) ===================== */
 const gmailClients = {};
@@ -176,9 +241,9 @@ async function getLatestNetflixCode(acc, afterSec) {
     const html = walkParts(full.data.payload, "text/html");
     const plain = walkParts(full.data.payload, "text/plain");
     const direct = findCode(subject + " " + plain + " " + html);
-    if (direct) return { code: direct };
+    if (direct) return { code: direct, at: Number(full.data.internalDate || 0) };
     const link = extractGetCodeLink(html);
-    if (link) return { link };
+    if (link) return { link, at: Number(full.data.internalDate || 0) };
   }
   return null;
 }
@@ -287,10 +352,15 @@ bot.on("callback_query", (q) => {
   bot.answerCallbackQuery(q.id).catch(() => {});
 });
 
+const accLock = new Map(); // accId -> { userId, at }: one customer at a time per account
+const lastCode = new Map(); // accId -> { userId, emailAt }: the newest code already handed out
+const OTP_LOCK_MS = Number(process.env.OTP_LOCK_SEC || 60) * 1000;
+
 bot.onText(/^\/otp/, async (msg) => {
   const id = msg.from.id;
   if (!hasAccess(id)) return bot.sendMessage(msg.chat.id, NO_PLAN);
-  const acc = store.accounts[store.assignments[id]];
+  const accId = store.assignments[id];
+  const acc = store.accounts[accId];
   if (!acc) return bot.sendMessage(msg.chat.id, "You don't have a login yet. Send /login first.");
 
   const o = (store.otp[id] = store.otp[id] || { used: 0, until: 0 });
@@ -300,24 +370,46 @@ bot.onText(/^\/otp/, async (msg) => {
   if (Date.now() - (lastOtp.get(id) || 0) < OTP_COOLDOWN_MS) {
     return bot.sendMessage(msg.chat.id, "Please wait 30 seconds before trying again.");
   }
+  // another customer on the same account is fetching a code right now: wait, so codes can't get mixed up
+  const lk = accLock.get(accId);
+  if (lk && lk.userId !== id && Date.now() - lk.at < OTP_LOCK_MS) {
+    return bot.sendMessage(msg.chat.id, "Another customer is getting a code on this account right now. Please try again in about a minute.");
+  }
   lastOtp.set(id, Date.now());
+  accLock.set(accId, { userId: id, at: Date.now() });
+  const release = () => accLock.get(accId) && accLock.get(accId).userId === id && accLock.delete(accId);
 
   try {
-    const result = await getLatestNetflixCode(acc);
+    // never hand one customer the code that was already given to another customer
+    const prev = lastCode.get(accId);
+    const afterSec = prev && prev.userId !== id && prev.emailAt ? Math.floor(prev.emailAt / 1000) + 1 : undefined;
+    const result = await getLatestNetflixCode(acc, afterSec);
     let text;
     if (result && result.code) text = `Your code: ${result.code}\n(Valid for a few minutes)`;
     else if (result && result.link) text = `Tap this link now to see your code (it expires soon):\n${result.link}`;
     else text = "No new code found. Request the code on Netflix first, then try again in a few seconds.";
     bot.sendMessage(msg.chat.id, text);
-    if (result && (result.code || result.link) && !inWindow) {
-      // a free code was used: count it and keep a short window open so a retry doesn't need approval
-      o.used++;
-      o.until = Date.now() + OTP_WINDOW_MS;
-      saveStore();
+    if (result && (result.code || result.link)) {
+      lastCode.set(accId, { userId: id, emailAt: result.at });
+      if (!inWindow) {
+        // a free code was used: count it and keep a short window open so a retry doesn't need approval
+        o.used++;
+        o.until = Date.now() + OTP_WINDOW_MS;
+        saveStore();
+      }
+    } else {
+      release();
     }
   } catch (e) {
     console.error(e);
-    bot.sendMessage(msg.chat.id, "Something went wrong. Try again shortly.");
+    release();
+    const problem = gmailProblem(e);
+    if (problem) {
+      alertAdmin("gmail-otp", `Gmail error while a customer asked for a code.\n${problem}`);
+      bot.sendMessage(msg.chat.id, "The code service is temporarily unavailable. The seller has been notified.");
+    } else {
+      bot.sendMessage(msg.chat.id, "Something went wrong. Try again shortly.");
+    }
   }
 });
 
@@ -402,35 +494,109 @@ bot.onText(/^\/otpreset(?:@\w+)?\s+(\d+)/, (msg, m) => {
   bot.sendMessage(msg.chat.id, `Code counter reset for ${m[1]}.`);
 });
 
+// /expiring [days]  -> customers whose plan ends soon (default 7 days) or already ended
+bot.onText(/^\/expiring(?:@\w+)?(?:\s+(\d+))?\s*$/, (msg, m) => {
+  if (!isAdmin(msg)) return;
+  const days = m[1] ? Number(m[1]) : 7;
+  const rows = [...customers.entries()]
+    .filter(([, exp]) => exp !== null && exp < Date.now() + days * 86400000)
+    .sort((a, b) => a[1] - b[1])
+    .slice(0, 60)
+    .map(([id, exp]) => `${id}: ${describeExpiry(exp)}${exp < Date.now() ? " (expired)" : ` (${Math.ceil((exp - Date.now()) / 86400000)} day(s) left)`} | login: ${store.assignments[id] || "none"}`);
+  bot.sendMessage(msg.chat.id, rows.length ? `Ending within ${days} day(s) or already ended:\n` + rows.join("\n") : `Nobody's plan ends within ${days} day(s).`);
+});
+
+// /customer <telegramId>  -> everything about one customer
+bot.onText(/^\/customer(?:@\w+)?\s+(\d+)/, (msg, m) => {
+  if (!isAdmin(msg)) return;
+  const id = Number(m[1]);
+  if (!customers.has(id)) return bot.sendMessage(msg.chat.id, "That ID is not a customer.");
+  const exp = customers.get(id);
+  const accId = store.assignments[id];
+  const acc = accId && store.accounts[accId];
+  const o = store.otp[id] || { used: 0, until: 0 };
+  const left = o.until > Date.now() ? `open for ${Math.ceil((o.until - Date.now()) / 60000)} more minute(s)` : "closed";
+  bot.sendMessage(
+    msg.chat.id,
+    `Customer ${id}\nPlan: ${describeExpiry(exp)}${exp === null ? "" : exp < Date.now() ? " (expired)" : ` (${Math.ceil((exp - Date.now()) / 86400000)} day(s) left)`}\n` +
+      `Login: ${acc ? `${accId} (${acc.email})` : "none"}\nCodes given: ${o.used}\nCode approval: ${left}`
+  );
+});
+
+// /broadcast <text>  -> message every customer with an active plan
+bot.onText(/^\/broadcast(?:@\w+)?\s+([\s\S]+)/, async (msg, m) => {
+  if (!isAdmin(msg)) return;
+  const ids = [...customers.keys()].filter(hasAccess);
+  let ok = 0;
+  let failed = 0;
+  bot.sendMessage(msg.chat.id, `Sending to ${ids.length} customer(s)...`);
+  for (const id of ids) {
+    try {
+      await bot.sendMessage(id, m[1].trim());
+      ok++;
+    } catch (e) {
+      failed++;
+    }
+    await new Promise((r) => setTimeout(r, 60)); // stay under Telegram's rate limit
+  }
+  bot.sendMessage(msg.chat.id, `Broadcast done: ${ok} delivered, ${failed} failed (they may have blocked the bot).`);
+});
+
+// /gmail  -> test the Gmail connection right now
+bot.onText(/^\/gmail(?:@\w+)?\s*$/, async (msg) => {
+  if (!isAdmin(msg)) return;
+  const problem = await checkGmail();
+  bot.sendMessage(msg.chat.id, problem ? `Gmail problem:\n${problem}` : "Gmail access works.");
+});
+
+// /admin  -> list of admin commands
+bot.onText(/^\/admin(?:@\w+)?\s*$/, (msg) => {
+  if (!isAdmin(msg)) return;
+  bot.sendMessage(
+    msg.chat.id,
+    [
+      "Customers: /add <id> <days|lifetime>, /remove <id>, /list, /customer <id>, /expiring [days], /broadcast <text>",
+      "Logins: /accounts, /addaccount <id> <email> [capacity], /delaccount <id>, /setcap <id> <n>, /unassign <id>, /ready <id>, /setpass <id> <password>",
+      "Codes: /allow <id> [minutes], /otpreset <id>, /gmail",
+    ].join("\n")
+  );
+});
+
 // /accounts -> pool overview
 bot.onText(/^\/accounts/, (msg) => {
   if (!isAdmin(msg)) return;
   const rows = Object.entries(store.accounts).map(
     ([id, a]) => `${id}: ${a.email} | ${a.status || "ready"} | users ${usersOn(id)}/${a.capacity || 1}`
   );
-  bot.sendMessage(msg.chat.id, rows.length ? rows.join("\n") : "No accounts in the pool. Add one with /addaccount <id> <email> <password> [capacity]");
+  bot.sendMessage(msg.chat.id, rows.length ? rows.join("\n") : "No accounts in the pool. Add one with /addaccount <id> <email> [capacity]");
 });
 
-// /addaccount <id> <email> <password> [capacity]  -> add a Netflix login to the pool
-// (the bot deletes your message afterwards so the password doesn't sit in the chat)
-bot.onText(/^\/addaccount(?:@\w+)?\s+(\S+)\s+(\S+@\S+)\s+(\S+)(?:\s+(\d+))?\s*$/, (msg, m) => {
+// /addaccount <id> <email> [capacity]            (no password needed)
+// /addaccount <id> <email> <password> [capacity]  (password only matters for AUTO_RESET)
+bot.onText(/^\/addaccount(?:@\w+)?\s+(\S+)\s+(\S+@\S+)(?:\s+(\S+))?(?:\s+(\d+))?\s*$/, (msg, m) => {
   if (!isAdmin(msg)) return;
-  const [, id, email, password, cap] = m;
+  const [, id, email, third, fourth] = m;
+  let password, cap;
+  if (third && /^\d{1,3}$/.test(third) && !fourth) cap = third; // "... email 2" = capacity
+  else {
+    password = third;
+    cap = fourth;
+  }
   const capacity = cap ? Math.max(1, Number(cap)) : 1;
   const done = (t) => {
-    bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+    if (password) bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
     bot.sendMessage(msg.chat.id, t);
   };
-  if (store.accounts[id]) return done(`Account id "${id}" already exists. Use /setpass ${id} <password> to change its password, or /delaccount ${id} first.`);
+  if (store.accounts[id]) return done(`Account id "${id}" already exists. Use /delaccount ${id} first, or pick another id.`);
   if (Object.values(store.accounts).some((a) => a.email.toLowerCase() === email.toLowerCase()))
     return done("That email is already in the pool.");
-  store.accounts[id] = { email, password, capacity, status: "ready" };
+  store.accounts[id] = { email, capacity, status: "ready", ...(password ? { password } : {}) };
   saveStore();
-  done(`Added ${id} (${email}), capacity ${capacity}, status ready. Your message with the password was deleted.`);
+  done(`Added ${id} (${email}), capacity ${capacity}, status ready.` + (password ? " Your message with the password was deleted." : ""));
 });
 bot.onText(/^\/addaccount(?:@\w+)?\s*$/, (msg) => {
   if (!isAdmin(msg)) return;
-  bot.sendMessage(msg.chat.id, "Usage: /addaccount <id> <email> <password> [capacity]\nExample: /addaccount nf2 name@gmail.com MyPass123 1");
+  bot.sendMessage(msg.chat.id, "Usage: /addaccount <id> <email> [capacity]\nExample: /addaccount nf2 name@gmail.com 1\n(A password is optional and only needed for AUTO_RESET: /addaccount nf2 name@gmail.com MyPass 1)");
 });
 
 // /setcap <id> <number>  -> change how many customers can share an account
@@ -499,4 +665,5 @@ setInterval(() => {
   }
 }, 24 * 60 * 60 * 1000);
 
+startupNotes.forEach((t) => notifyAdmin(t));
 console.log("OTP bot running");
