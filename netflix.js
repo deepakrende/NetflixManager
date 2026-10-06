@@ -73,6 +73,23 @@ function planCleanup(rows, botHint, ctx) {
   );
   const devices = rows.filter((r) => !isBot(r));
   if (devices.length < 2) return { action: "none", note: "Only one device found, nothing to sign out.", lines, remove: [] };
+  // SHARED account (several customers): only ever remove devices that match THIS customer's
+  // previous device names, and never one whose name also matches another customer's device.
+  // No time-based fallback here, because the newest device may belong to someone else.
+  if (ctx && ctx.shared) {
+    if (!ctx.keepName || !ctx.oldNames || !ctx.oldNames.length) {
+      return { action: "none", note: "Shared account: no earlier device saved for this customer, nothing to sign out.", lines, remove: [] };
+    }
+    const mine = devices.filter((d) => ctx.oldNames.some((n) => nameMatches(d.text, n)) && !nameMatches(d.text, ctx.keepName));
+    const safe = mine.filter((d) => !(ctx.otherNames || []).some((n) => nameMatches(d.text, n)));
+    if (!safe.length) {
+      return mine.length
+        ? { action: "abort", note: "Shared account: the old device's name also matches another customer's device, so nothing was signed out.", lines, remove: [] }
+        : { action: "none", note: "Shared account: this customer's old device was not found in the list.", lines, remove: [] };
+    }
+    const keep = devices.find((d) => nameMatches(d.text, ctx.keepName)) || null;
+    return { action: "remove", method: "name", keep, remove: safe, lines, note: "Shared account: matched this customer's old device by name." };
+  }
   // 1) preferred: match rows to the device names saved from earlier sign-in emails
   if (ctx && ctx.keepName && ctx.oldNames && ctx.oldNames.length) {
     const matched = devices.filter(
