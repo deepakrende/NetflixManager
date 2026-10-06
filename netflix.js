@@ -170,16 +170,49 @@ async function passMfaIfAsked(page, context, getCode) {
   return true;
 }
 
+const CODE_PROMPT = /verification code|sign-in code|enter (the |your )?code|we sent (you )?a code|email a code/i;
+
+// Netflix shows a cookie banner that can cover the form: reject it so it never blocks a click
+async function dismissCookies(page) {
+  const btn = page.getByRole("button", { name: /^reject$/i }).first();
+  if (await btn.isVisible().catch(() => false)) {
+    await btn.click().catch(() => {});
+    await page.waitForTimeout(500);
+  }
+}
+
 async function loginFlow(page, context, acc, getCode) {
   const startSec = Math.floor(Date.now() / 1000) - 5;
   await page.goto("https://www.netflix.com/login");
+  await page.waitForTimeout(2500);
+  await dismissCookies(page);
   await page.getByLabel(/email|mobile/i).first().fill(acc.email);
-  await page.getByLabel(/password/i).first().fill(acc.password);
-  await page.getByRole("button", { name: /^sign in$/i }).first().click();
-  await page.waitForTimeout(5000);
+
+  // Netflix's login is often two steps: email -> "Continue" -> password (or a sign-in code)
+  let pw = page.getByLabel(/password/i).first();
+  if (!(await pw.isVisible().catch(() => false))) {
+    await page.getByRole("button", { name: /^(continue|next)$/i }).first().click();
+    await page.waitForTimeout(3500);
+    await dismissCookies(page);
+    pw = page.getByLabel(/password/i).first();
+    const codeAlready = await page.getByText(CODE_PROMPT).first().isVisible().catch(() => false);
+    if (!(await pw.isVisible().catch(() => false)) && !codeAlready) {
+      const usePw = page.getByText(/use (your )?password|sign in with (a )?password/i).first();
+      if (await usePw.count()) {
+        await usePw.click().catch(() => {});
+        await page.waitForTimeout(2000);
+      }
+      pw = page.getByLabel(/password/i).first();
+    }
+  }
+  if (await pw.isVisible().catch(() => false)) {
+    await pw.fill(acc.password);
+    await page.getByRole("button", { name: /^(sign in|continue|next)$/i }).first().click();
+    await page.waitForTimeout(5000);
+  }
 
   const needsCode = await page
-    .getByText(/verification code|sign-in code|enter (the |your )?code|we sent (you )?a code/i)
+    .getByText(CODE_PROMPT)
     .first()
     .isVisible()
     .catch(() => false);
