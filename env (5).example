@@ -1,0 +1,20 @@
+# ---- Telegram ----
+TELEGRAM_TOKEN=
+ADMIN_ID=
+
+# ---- Gmail (read-only OAuth) ----
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_REFRESH_TOKEN=
+
+# ---- storage (point these at the Railway Volume, e.g. /data) ----
+DATA_FILE=/data/customers.json
+ACCOUNTS_FILE=/data/accounts.json
+SESSIONS_DIR=/data/sessions
+
+# ---- optional: auto password-reset when an account is released ----
+AUTO_RESET=0
+
+# ---- code approval (every code after the free ones needs your OK in Telegram) ----
+OTP_FREE_USES=1
+OTP_APPROVAL_WINDOW_MIN=15
