@@ -508,6 +508,17 @@ bot.onText(/^\/addaccount(?:@\w+)?\s*$/, (msg) => {
   bot.sendMessage(msg.chat.id, "Usage: /addaccount <id> <email> <password> [capacity]\nExample: /addaccount nf2 name@gmail.com MyPass123 1");
 });
 
+// /setcap <id> <number>  -> change how many customers can share an account
+bot.onText(/^\/setcap(?:@\w+)?\s+(\S+)\s+(\d+)\s*$/, (msg, m) => {
+  if (!isAdmin(msg)) return;
+  const acc = store.accounts[m[1]];
+  if (!acc) return bot.sendMessage(msg.chat.id, "Unknown account id.");
+  const cap = Math.max(1, Number(m[2]));
+  acc.capacity = cap;
+  saveStore();
+  bot.sendMessage(msg.chat.id, `${m[1]} capacity set to ${cap} (currently ${usersOn(m[1])} user(s) assigned).`);
+});
+
 // /delaccount <id>  -> remove an account from the pool (only if nobody is assigned to it)
 bot.onText(/^\/delaccount(?:@\w+)?\s+(\S+)/, (msg, m) => {
   if (!isAdmin(msg)) return;
