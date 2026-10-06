@@ -39,10 +39,7 @@ GOOGLE_REFRESH_TOKEN=...
 DATA_FILE=/data/customers.json
 ACCOUNTS_FILE=/data/accounts.json
 SESSIONS_DIR=/data/sessions
-DEVICE_CLEANUP=dry
 ```
-Leave `DEVICE_CLEANUP=dry` until you've checked its reports against the real Netflix pages —
-see the testing steps at the end of this file.
 
 ## 5. Turn off the healthcheck
 This bot doesn't serve a web port — it just connects out to Telegram and Gmail. Railway's
@@ -75,14 +72,9 @@ see `OTP bot running` once it's up.
 1. In Telegram, message your bot as the admin: `/add <your_own_telegram_id> lifetime`
 2. `/login` — you should get back one of the accounts from `accounts.json`.
 3. `/otp` — confirms Gmail is wired up correctly.
-4. Sign in on a second device yourself, then `/done` — with `DEVICE_CLEANUP=dry`, check the
-   report the bot sends you (in your Telegram, since you're the admin) against what the real
-   Netflix "Manage Access and Devices" page shows.
-5. Once a few dry runs match reality, set `DEVICE_CLEANUP=on` and redeploy.
 
 ## Notes
-- Memory: the Playwright browser uses roughly 300–500 MB while a cleanup or login is running.
-  If you're on Railway's smallest plan and see out-of-memory restarts, upgrade the plan.
+- Memory: only if you turn on AUTO_RESET does the bot start a Playwright browser (roughly 300–500 MB).
 - Logs: `console.error` calls show up in Railway's Deploy Logs — check there first if
   something isn't working.
 - Rotating the Google refresh token or Telegram token: just update the Variable and redeploy,
