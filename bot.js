@@ -490,7 +490,42 @@ bot.onText(/^\/accounts/, (msg) => {
   const rows = Object.entries(store.accounts).map(
     ([id, a]) => `${id}: ${a.email} | ${a.status || "ready"} | users ${usersOn(id)}/${a.capacity || 1}`
   );
-  bot.sendMessage(msg.chat.id, rows.length ? rows.join("\n") : "No accounts in the pool. Add them to accounts.json.");
+  bot.sendMessage(msg.chat.id, rows.length ? rows.join("\n") : "No accounts in the pool. Add one with /addaccount <id> <email> <password> [capacity]");
+});
+
+// /addaccount <id> <email> <password> [capacity]  -> add a Netflix login to the pool
+// (the bot deletes your message afterwards so the password doesn't sit in the chat)
+bot.onText(/^\/addaccount(?:@\w+)?\s+(\S+)\s+(\S+@\S+)\s+(\S+)(?:\s+(\d+))?\s*$/, (msg, m) => {
+  if (!isAdmin(msg)) return;
+  const [, id, email, password, cap] = m;
+  const capacity = cap ? Math.max(1, Number(cap)) : 1;
+  const done = (t) => {
+    bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+    bot.sendMessage(msg.chat.id, t);
+  };
+  if (store.accounts[id]) return done(`Account id "${id}" already exists. Use /setpass ${id} <password> to change its password, or /delaccount ${id} first.`);
+  if (Object.values(store.accounts).some((a) => a.email.toLowerCase() === email.toLowerCase()))
+    return done("That email is already in the pool.");
+  store.accounts[id] = { email, password, capacity, status: "ready" };
+  saveStore();
+  done(`Added ${id} (${email}), capacity ${capacity}, status ready. Your message with the password was deleted.`);
+});
+bot.onText(/^\/addaccount(?:@\w+)?\s*$/, (msg) => {
+  if (!isAdmin(msg)) return;
+  bot.sendMessage(msg.chat.id, "Usage: /addaccount <id> <email> <password> [capacity]\nExample: /addaccount nf2 name@gmail.com MyPass123 1");
+});
+
+// /delaccount <id>  -> remove an account from the pool (only if nobody is assigned to it)
+bot.onText(/^\/delaccount(?:@\w+)?\s+(\S+)/, (msg, m) => {
+  if (!isAdmin(msg)) return;
+  const id = m[1];
+  if (!store.accounts[id]) return bot.sendMessage(msg.chat.id, "Unknown account id.");
+  const n = usersOn(id);
+  if (n > 0) return bot.sendMessage(msg.chat.id, `${id} still has ${n} user(s) assigned. Use /remove <telegramId> for them first.`);
+  delete store.accounts[id];
+  delete store.watch[id];
+  saveStore();
+  bot.sendMessage(msg.chat.id, `Removed ${id} from the pool.`);
 });
 
 // /ready <accountId>  -> put a reset account back in the pool
