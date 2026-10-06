@@ -54,7 +54,10 @@ store.accounts = store.accounts || {};
 store.assignments = store.assignments || {};
 store.lastChange = store.lastChange || {};
 store.watch = store.watch || {}; // accountId -> ms timestamp of the last 'new device' email handled
-store.devices = store.devices || {}; // telegramId -> [{accId,emailId,at,device,profile,location,raw}]
+store.devices = store.devices || {};
+store.owned = store.owned || {}; // shared accounts: accId -> [{key, owner, fresh}] rows on Netflix's device list and who they belong to
+store.otpLog = store.otpLog || {}; // accId -> [{userId, at}] who asked for a code and when
+store.lastScan = store.lastScan || {}; // accId -> ms of the last device-list scan // telegramId -> [{accId,emailId,at,device,profile,location,raw}]
 const saveStore = () => fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(store, null, 2));
 
 const usersOn = (accId) => Object.values(store.assignments).filter((a) => a === accId).length;
@@ -160,6 +163,100 @@ function scheduleCleanup(accId, userId, delayMin) {
     }, ms)
   );
 }
+// ---- shared accounts: remember which rows of Netflix's device list belong to which customer ----
+// Customers have no password, so every NEW device needs a code from /otp. That moment tells us who
+// the next new row on the device list belongs to. Emails from Netflix are not needed.
+function logOtp(accId, userId) {
+  const list = (store.otpLog[accId] = store.otpLog[accId] || []);
+  list.push({ userId: String(userId), at: Date.now() });
+  if (list.length > 40) list.shift();
+  saveStore();
+}
+const rowKey = (t) =>
+  (t || "")
+    .replace(/\d{1,2}\/\d{1,2}\/\d{2,4},?\s*\d{1,2}:\d{2}\s*[ap]m(\s*[A-Z]{2,5})?/gi, " ")
+    .replace(/current device|last used|sign out|device|[^a-z0-9 ]/gi, " ")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 60);
+
+function makeOwnerPlanner(accId, userId, botHint) {
+  const uid = String(userId);
+  const botRe = new RegExp(botHint || "linux", "i");
+  let reconciled = false;
+  return (rows) => {
+    const isBot = (r) => r.isCurrent || botRe.test(r.text);
+    const lines = rows.map(
+      (r) => `- ${r.text.slice(0, 90)} => ` + (isBot(r) ? "(current/bot device, ignored)" : Number.isFinite(r.age) ? `${Math.round(r.age)} min ago` : "time unreadable")
+    );
+    const devices = rows.filter((r) => !isBot(r)).map((r) => ({ ...r, key: rowKey(r.text) }));
+    if (!devices.length) return { action: "abort", note: "Shared account: couldn't read any device rows. Nothing changed.", lines, remove: [] };
+
+    const count = {};
+    devices.forEach((d) => (count[d.key] = (count[d.key] || 0) + 1));
+    // forget rows that no longer exist on Netflix
+    const seen = {};
+    let owned = (store.owned[accId] || []).filter((e) => {
+      seen[e.key] = (seen[e.key] || 0) + 1;
+      return seen[e.key] <= (count[e.key] || 0);
+    });
+
+    if (!reconciled) {
+      reconciled = true;
+      owned.forEach((e) => (e.fresh = false));
+      const asks = (store.otpLog[accId] || []).filter((e) => !e.done); // code requests not yet matched to a scan
+      const requesters = [...new Set(asks.map((e) => e.userId))];
+      const owner = requesters.length === 1 ? requesters[0] : null;
+      const isFirst = !(store.owned[accId] || []).length;
+      const sinceMin = asks.length ? (Date.now() - Math.min(...asks.map((e) => e.at))) / 60000 : 0;
+      const have = {};
+      owned.forEach((e) => (have[e.key] = (have[e.key] || 0) + 1));
+      for (const d of devices) {
+        if ((have[d.key] || 0) >= count[d.key]) continue;
+        have[d.key] = (have[d.key] || 0) + 1;
+        // first scan ever: only rows used since the code was requested are attributed
+        const mine = owner && (!isFirst || (Number.isFinite(d.age) && d.age <= sinceMin + 3));
+        owned.push({ key: d.key, owner: mine ? owner : null, fresh: !!mine && owner === uid });
+      }
+      asks.forEach((e) => (e.done = true));
+      store.lastScan[accId] = Date.now();
+      if (requesters.length > 1) notifyAdmin(`${accId}: ${requesters.length} customers asked for a code at about the same time, so their new devices can't be told apart. Nothing was signed out for them.`);
+    }
+    store.owned[accId] = owned;
+    saveStore();
+
+    const fresh = owned.filter((e) => e.owner === uid && e.fresh);
+    const old = owned.filter((e) => e.owner === uid && !e.fresh);
+    if (!fresh.length) return { action: "none", note: "Shared account: no new device found for this customer.", lines, remove: [] };
+    if (!old.length) return { action: "none", note: "Shared account: this customer has no earlier device on record.", lines, remove: [] };
+
+    const remove = [];
+    const skipped = [];
+    for (const key of [...new Set(old.map((e) => e.key))]) {
+      const sameKey = owned.filter((e) => e.key === key);
+      if (sameKey.some((e) => e.owner !== uid)) {
+        skipped.push(key);
+        continue; // the same device name belongs to someone else too: never guess
+      }
+      const need = old.filter((e) => e.key === key).length;
+      const rowsHere = devices.filter((d) => d.key === key).sort((a, b) => b.age - a.age); // oldest first
+      if (rowsHere.length > need && rowsHere.some((d) => !Number.isFinite(d.age))) {
+        skipped.push(key);
+        continue;
+      }
+      remove.push(...rowsHere.slice(0, need));
+    }
+    const keep = devices.find((d) => fresh.some((f) => f.key === d.key && !remove.includes(d))) || null;
+    if (!remove.length) {
+      return skipped.length
+        ? { action: "abort", note: "Shared account: the old device looks the same as another customer's device, so nothing was signed out.", lines, remove: [] }
+        : { action: "none", note: "Shared account: nothing to sign out.", lines, remove: [] };
+    }
+    return { action: "remove", method: "owner", keep, remove, lines, note: "Shared account: signing out this customer's previous device." };
+  };
+}
+
 async function runCleanup(accId, userId, manual) {
   const mode = process.env.DEVICE_CLEANUP || "off";
   const acc = store.accounts[accId];
@@ -170,19 +267,15 @@ async function runCleanup(accId, userId, manual) {
     const { cleanupDevices } = require("./netflix");
     const all = (store.devices[userId] || []).filter((r) => r.accId === accId);
     const latest = all[all.length - 1];
-    if (shared && !(latest && latest.device)) return say("I couldn't tell which device you just signed in, so nothing was changed.");
-    // on a shared account, collect the other customers' device names so we never touch those
-    const otherNames = shared
-      ? Object.entries(store.assignments)
-          .filter(([u, a]) => a === accId && String(u) !== String(userId))
-          .flatMap(([u]) => (store.devices[u] || []).map((r) => r.device))
-          .filter(Boolean)
-      : [];
-    const ctx = latest && latest.device ? { keepName: latest.device, oldNames: all.slice(0, -1).map((r) => r.device).filter(Boolean), shared, otherNames } : null;
+    const hint = process.env.BOT_DEVICE_HINT || "linux";
+    // one customer on the account: use the device names from Netflix's emails (as before)
+    // several customers: use the ownership list built from /otp requests
+    const ctx = !shared && latest && latest.device ? { keepName: latest.device, oldNames: all.slice(0, -1).map((r) => r.device).filter(Boolean) } : null;
     const r = await cleanupDevices(accId, acc, (since) => getLatestNetflixCode(acc, since), {
       dryRun: mode !== "on",
-      botHint: process.env.BOT_DEVICE_HINT || "linux",
+      botHint: hint,
       ctx,
+      planner: shared ? makeOwnerPlanner(accId, userId, hint) : undefined,
     });
     if (mode === "on" && r.removed > 0 && latest) {
       store.devices[userId] = [latest]; // only the current device stays on record
@@ -400,6 +493,7 @@ bot.onText(/^\/otp/, async (msg) => {
     bot.sendMessage(msg.chat.id, text);
     if (result && (result.code || result.link)) {
       recordDevice(id, store.assignments[id], result.info, result.emailId);
+      logOtp(store.assignments[id], id);
       scheduleCleanup(store.assignments[id], id);
     }
   } catch (e) {
