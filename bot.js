@@ -72,7 +72,6 @@ function releaseUser(userId) {
   if (!accId) return null;
   delete store.assignments[userId];
   delete store.devices[userId];
-  if (store.accounts[accId]) store.accounts[accId].status = "needs_reset";
   saveStore();
   return accId;
 }
@@ -93,9 +92,8 @@ function afterRelease(accId, userId, why) {
   if (process.env.AUTO_RESET === "1" && usersOn(accId) === 0) {
     notifyAdmin(`Account ${accId} released (${why}). Signing out all devices + changing the password automatically...`);
     resetQueue = resetQueue.then(() => autoReset(accId)).catch(console.error);
-  } else {
-    adminResetNotice(accId, userId, why);
   }
+  // otherwise nothing to do: the account stays "ready" and the slot is simply free again
 }
 async function autoReset(accId) {
   const acc = store.accounts[accId];
