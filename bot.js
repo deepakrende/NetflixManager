@@ -350,8 +350,8 @@ bot.onText(/^\/login/, (msg) => {
       // nothing else to switch to: just show the login they already have
       return bot.sendMessage(
         chat,
-        `No other login is available right now, so you keep your current one:\nEmail: ${cur.email}\nPassword: ${cur.password}\n\n` +
-          `When Netflix asks for a code, request it there and then send /otp here.`
+        `No other login is available right now, so you keep your current one:\nEmail: ${cur.email}\n\n` +
+          `On Netflix choose "Use a sign-in code" (no password needed), then send /otp here.`
       );
     }
     return bot.sendMessage(chat, "No login is available right now. Please contact the seller.");
@@ -367,8 +367,8 @@ bot.onText(/^\/login/, (msg) => {
 
   bot.sendMessage(
     chat,
-    `Your Netflix login:\nEmail: ${acc.email}\nPassword: ${acc.password}\n\n` +
-      `When Netflix asks for a code, request it there and then send /otp here.` +
+    `Your Netflix login:\nEmail: ${acc.email}\n\n` +
+      `On Netflix enter this email and choose "Use a sign-in code" (no password needed). Request the code there, then send /otp here.` +
       (oldId ? "\n\nYour previous login has been deactivated." : "")
   );
   if (oldId) afterRelease(oldId, id, "user got a new login");
@@ -379,7 +379,7 @@ bot.onText(/^\/mylogin/, (msg) => {
   if (!hasAccess(id)) return bot.sendMessage(msg.chat.id, NO_PLAN);
   const acc = store.accounts[store.assignments[id]];
   if (!acc) return bot.sendMessage(msg.chat.id, "You don't have a login yet. Send /login.");
-  bot.sendMessage(msg.chat.id, `Email: ${acc.email}\nPassword: ${acc.password}`);
+  bot.sendMessage(msg.chat.id, `Email: ${acc.email}`);
 });
 
 bot.onText(/^\/otp/, async (msg) => {
