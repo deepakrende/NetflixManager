@@ -1,0 +1,5 @@
+node_modules/
+.env
+customers.json
+accounts.json
+sessions/
